@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Daily Check-in",
+    "description": "Runs the WorkBuddy, WPS Lingxi and Qoder daily check-ins when DSH starts, with a status panel in the session title bar."
+  }
+}

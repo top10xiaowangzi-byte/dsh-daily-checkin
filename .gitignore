@@ -1,0 +1,13 @@
+# 编辑器 / 系统
+Thumbs.db
+.DS_Store
+*.log
+
+# 本地备份（改造前的旧文件）
+*.bak-*
+*.bak
+node_modules/
+
+# 本地私有配置
+.env
+.env.local

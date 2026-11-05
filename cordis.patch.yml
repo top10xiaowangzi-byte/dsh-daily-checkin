@@ -1,0 +1,4 @@
+- insert:
+    - id: daily-checkin
+      name: dsh-daily-checkin
+      config: {}

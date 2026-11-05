@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "每日签到（WorkBuddy / 灵犀 / Qoder）",
+    "description": "DSH 启动时自动完成 WorkBuddy、WPS 灵犀与 Qoder 的每日签到，并在会话标题栏显示签到结果面板。"
+  }
+}

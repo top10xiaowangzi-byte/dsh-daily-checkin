@@ -1,0 +1,30 @@
+{
+  "name": "dsh-daily-checkin",
+  "displayName": "DSH Daily Check-in (WorkBuddy / 灵犀 / Qoder)",
+  "version": "1.1.0",
+  "private": true,
+  "description": "DSH 启动时自动完成 WorkBuddy、WPS 灵犀与 Qoder 的每日签到，并在会话标题栏显示签到结果面板（失败可重试）。",
+  "keywords": ["dsh-plugin", "daily-checkin", "lingxi", "qoder", "wps"],
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": ["index.mjs", "client.js", "cookies-helper.mjs", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["slots"]
+    }
+  },
+  "peerDependencies": {
+    "react": "^18.2.0"
+  }
+}
