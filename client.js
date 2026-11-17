@@ -94,7 +94,7 @@ window.__ModuleLoader__.load({
 				try {
 					const response = await fetch(path || "/daily-checkin/status", {
 						...(init || {}),
-						signal: AbortSignal.timeout(2e4)
+						signal: AbortSignal.timeout(init && init.method === "POST" ? 12e4 : 2e4)
 					});
 					if (!response.ok) throw new Error("HTTP " + response.status);
 					const d = await response.json();
@@ -167,7 +167,18 @@ window.__ModuleLoader__.load({
 						whiteSpace: "nowrap"
 					}
 				}, stateText(row))
-			)));
+			),
+				typeof row.meta === "string" && row.meta ? h("div", {
+					style: {
+						fontSize: 11,
+						color: labelSecondary,
+						opacity: 0.85,
+						marginTop: 2,
+						overflow: "hidden",
+						textOverflow: "ellipsis",
+						whiteSpace: "nowrap"
+					}
+				}, row.meta) : null));
 
 			const retryButton = failed ? h("button", {
 				disabled: retrying,
@@ -214,11 +225,11 @@ window.__ModuleLoader__.load({
 				}
 			}, "×"), h("b", { style: { display: "flex", alignItems: "center", gap: 6, fontSize: 14 } },
 				h("img", { src: icon, style: { width: 16, height: 16 } }),
-				"每日签到（WorkBuddy / 灵犀 / Qoder）"
+				"每日签到（WorkBuddy / 灵犀 / Qoder / MiniMax / 码道）"
 			), h("div", { style: { color: labelSecondary, fontSize: 12, margin: "7px 0" } },
 				"本次启动检查：",
 				data.checkedAt ? new Date(data.checkedAt).toLocaleString() : "—"
-			), loading ? h("div", { role: "status" }, "正在查询…") : null, queryError ? h("div", { role: "alert" }, queryError) : null, h("div", { style: { maxHeight: 160, overflowY: "auto" } }, rows), retryButton) : null;
+			), loading ? h("div", { role: "status" }, "正在查询…") : null, queryError ? h("div", { role: "alert" }, queryError) : null, h("div", { style: { maxHeight: 240, overflowY: "auto" } }, rows), retryButton) : null;
 
 			return h(react.Fragment, null, toastEl, panel);
 		}
@@ -248,7 +259,7 @@ window.__ModuleLoader__.load({
 			if (!data || data.status === "none" || !Array.isArray(data.results)) return null;
 			return h("button", {
 				onClick: () => setPanelOpen(!open),
-				title: "每日签到（WorkBuddy / 灵犀 / Qoder）",
+				title: "每日签到（WorkBuddy / 灵犀 / Qoder / MiniMax / 码道）",
 				style: {
 					display: "inline-flex",
 					alignItems: "center",

@@ -1,10 +1,10 @@
 {
   "name": "dsh-daily-checkin",
-  "displayName": "DSH Daily Check-in (WorkBuddy / 灵犀 / Qoder)",
-  "version": "1.1.0",
+  "displayName": "DSH Daily Check-in (WorkBuddy / 灵犀 / Qoder / 码道)",
+  "version": "1.4.0",
   "private": true,
-  "description": "DSH 启动时自动完成 WorkBuddy、WPS 灵犀与 Qoder 的每日签到，并在会话标题栏显示签到结果面板（失败可重试）。",
-  "keywords": ["dsh-plugin", "daily-checkin", "lingxi", "qoder", "wps"],
+  "description": "DSH 启动时自动完成 WorkBuddy、WPS 灵犀、Qoder、MiniMax Code 与码道 CodeArts 的每日签到/领取积分，并在会话标题栏显示签到结果面板（失败可重试）。",
+  "keywords": ["dsh-plugin", "daily-checkin", "lingxi", "qoder", "wps", "codearts", "huaweicloud"],
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -15,7 +15,18 @@
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
-  "files": ["index.mjs", "client.js", "cookies-helper.mjs", "cordis.patch.yml", "locale/*.json", "icon.svg"],
+  "files": [
+    "index.mjs",
+    "client.js",
+    "cookies-helper.mjs",
+    "codearts-browser-common.mjs",
+    "codearts-claim.mjs",
+    "codearts-login.mjs",
+    "码道登录.cmd",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {

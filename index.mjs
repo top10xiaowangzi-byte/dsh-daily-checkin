@@ -1,13 +1,16 @@
 /**
- * dsh-daily-checkin —— DSH 启动时自动完成 WPS 灵犀与 Qoder 的每日签到。
+ * dsh-daily-checkin —— DSH 启动时自动完成 WorkBuddy、WPS 灵犀、Qoder、MiniMax Code、码道 CodeArts 的每日签到。
  *
  * - Host 半：读取本机客户端登录态（只读、只在内存中解密），调用官方接口签到；
+ *   MiniMax Code 只读 ~/.mavis/auth/.../auth.json 里的 accessToken，不刷新、不改写；
+ *   码道 CodeArts 走无头浏览器（codearts-claim.mjs）：注入登录快照 → SSO 自动续期 → 页面内调接口领取；
  *   状态写入 $DSH_HOME/.daily-checkin.json；向本地 Web UI 提供状态/重试接口；
  *   跨天后的第一次面板打开会自动补签当天。
  * - Client 半：会话标题栏入口 + 结果面板（失败可重试）。
  *
  * 安全：token/cookie 只在内存中使用，不落盘、不打印；只读客户端登录态文件。
- * 平台：WPS 灵犀 / Qoder 的登录态解密依赖 Windows（DPAPI + Chromium Cookie）。
+ *       码道登录快照（$DSH_HOME/codearts-session.json）是唯一落盘的凭据文件，权限 600，仅本机使用。
+ * 平台：WPS 灵犀 / Qoder 的登录态解密依赖 Windows（DPAPI + Chromium Cookie）；码道依赖 Playwright。
  */
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -17,6 +20,11 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from '
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  baseUrl as CODEARTS_BASE,
+  profileDir as CODEARTS_PROFILE_DIR,
+  statePath as CODEARTS_STATE_PATH,
+} from './codearts-browser-common.mjs';
 
 export const name = 'dsh-daily-checkin';
 export const inject = ['webServer'];
@@ -25,6 +33,8 @@ const TITLE = {
   workbuddy: 'WorkBuddy',
   lingxi: 'WPS 灵犀',
   qoder: 'Qoder',
+  codearts: '码道 CodeArts',
+  minimax: 'MiniMax Code',
 };
 
 const LINGXI_TASKS = 'https://lingxi.wps.cn/api/public/v1/tasks';
@@ -130,7 +140,7 @@ async function chromiumKeyFor(localStatePath) {
   return key;
 }
 
-function decryptChromiumValue(key, encryptedValue) {
+function decryptChromiumValue(key, encryptedValue, hostKey) {
   const value = Buffer.isBuffer(encryptedValue) ? encryptedValue : Buffer.from(encryptedValue ?? []);
   if (value.length === 0) return '';
   const prefix = value.subarray(0, 3).toString('latin1');
@@ -151,7 +161,17 @@ function decryptChromiumValue(key, encryptedValue) {
   }
   if (plain.length > 32) {
     const head = plain.subarray(0, 32);
-    if ([...head].some((byte) => byte < 0x20 || byte > 0x7e)) plain = plain.subarray(32);
+    // Chromium 127+ 的 Cookie 明文前面带 sha256(host_key)（host 绑定），解出后要剥掉。
+    let bound = false;
+    if (typeof hostKey === 'string' && hostKey) {
+      try {
+        bound = createHash('sha256').update(hostKey).digest().equals(head);
+      } catch {
+        bound = false;
+      }
+    }
+    if (!bound && [...head].some((byte) => byte < 0x20 || byte > 0x7e)) bound = true;
+    if (bound) plain = plain.subarray(32);
   }
   return plain.toString('utf8');
 }
@@ -323,7 +343,7 @@ async function readChromiumCookiesNative(dbPath, key, { filterHost, names } = {}
           let value = plainValue;
           if (!value && row.encrypted_value) {
             try {
-              value = decryptChromiumValue(key, row.encrypted_value);
+              value = decryptChromiumValue(key, row.encrypted_value, host);
             } catch {
               continue;
             }
@@ -720,6 +740,411 @@ async function runQoder() {
     ...base,
     state: 'failed',
     error: `Qoder 领取失败：${shortText(claimResponse.payload?.error || claimResponse.payload?.msg || `HTTP ${claimResponse.status}`)}`,
+  };
+}
+
+// ---------------------------------------------------------------- MiniMax Code（每日签到领积分）
+
+const MINIMAX_ORIGIN = 'https://agent.minimax.cn';
+const MINIMAX_SIGNIN_STATUS = '/minimax-cloud/api/v1/signin/status';
+const MINIMAX_SIGNIN_CLAIM = '/minimax-cloud/api/v1/signin/claim';
+const MINIMAX_CREDIT_DETAILS = '/minimax-cloud/api/v1/credit/details';
+const MINIMAX_RECORD_PREFIX = 'com.minimax.mcode.oauth.prod.cn';
+const MINIMAX_DAY = { UPCOMING: 1, CLAIMABLE: 2, CLAIMED: 3, DISABLED: 4 };
+const MINIMAX_UNAUTHORIZED = 1000048;
+
+function minimaxAuthFile() {
+  return (
+    process.env.MINIMAX_AUTH_FILE ||
+    join(homedir(), '.mavis', 'auth', 'prod', 'cn', 'mcode-public', 'auth.json')
+  );
+}
+
+/**
+ * 只读 MiniMax Code 的 OAuth 凭据（明文 JSON）。不自己刷新：refresh token 是轮换式的，
+ * 插件刷新会让 MiniMax Code 自己手里的 refresh token 失效、被迫重新登录。
+ */
+function minimaxCredential() {
+  const path = minimaxAuthFile();
+  if (!existsSync(path)) throw new Error('找不到 MiniMax Code 登录态（请先登录 MiniMax Code 桌面版）');
+  let payload;
+  try {
+    payload = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new Error('MiniMax Code 登录态文件不是合法 JSON');
+  }
+  const records = Object.entries(payload?.records ?? {});
+  const preferred = records.find(([key]) => key.startsWith(MINIMAX_RECORD_PREFIX)) ?? records[0];
+  const credential = preferred?.[1];
+  if (typeof credential?.accessToken !== 'string' || !credential.accessToken) {
+    throw new Error('MiniMax Code 登录态里没有 accessToken（请在 MiniMax Code 重新登录）');
+  }
+  return credential;
+}
+
+function minimaxMd5(value) {
+  return createHash('md5').update(value).digest('hex');
+}
+
+/** 签名算法与 MiniMax Code 客户端一致（yy / x-timestamp / x-signature）。 */
+async function minimaxRequest(credential, path, { method = 'GET', query } = {}) {
+  const requestTime = Date.now();
+  const url = new URL(path, MINIMAX_ORIGIN);
+  url.search = new URLSearchParams({
+    device_platform: 'mcode',
+    biz_id: '3',
+    app_id: '3001',
+    version_code: '22201',
+    unix: String(requestTime),
+    timezone_offset: String(new Date().getTimezoneOffset() * -60),
+    sys_language: 'zh',
+    lang: 'zh',
+    device_id: '0',
+    os_name: process.platform,
+    browser_name: 'mcode',
+    user_id: '0',
+    client: 'mcode',
+    ...(query ?? {}),
+  }).toString();
+  const body = '{}';
+  const second = Math.floor(requestTime / 1000);
+  return httpJson(url.href, {
+    method,
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'MiniMaxCode',
+      Authorization: `Bearer ${credential.accessToken}`,
+      yy: minimaxMd5(`${encodeURIComponent(`${url.pathname}${url.search}`)}_${body}${minimaxMd5(String(requestTime))}ooui`),
+      'x-timestamp': String(second),
+      'x-signature': minimaxMd5(`${second}I*7Cf%WZ#S&%1RlZJ&C2`),
+    },
+    body: method === 'POST' ? body : undefined,
+  });
+}
+
+/** 返回 data；登录态被拒时抛带 unauthorized 标记的错误。 */
+function minimaxData({ status, payload }, what) {
+  const code = payload?.base_resp?.status_code ?? payload?.statusInfo?.code;
+  if (status === 401 || code === MINIMAX_UNAUTHORIZED) {
+    const error = new Error('MiniMax 登录态被拒绝：请打开一次 MiniMax Code 刷新登录后重试');
+    error.unauthorized = true;
+    throw error;
+  }
+  if (status !== 200) throw new Error(`MiniMax ${what}失败：HTTP ${status}`);
+  if (typeof code === 'number' && code !== 0) {
+    const message = payload?.base_resp?.status_msg || payload?.statusInfo?.message || `code ${code}`;
+    throw new Error(`MiniMax ${what}失败：${shortText(message)}`);
+  }
+  if (payload?.data === null || payload?.data === undefined) throw new Error(`MiniMax ${what}返回里没有 data`);
+  return payload.data;
+}
+
+function minimaxDayPoints(day) {
+  const points = Number(day?.points) || 0;
+  const bonus = Number(day?.bonus_points) || 0;
+  return points + bonus;
+}
+
+/** 本周期内（第 1 天到今天）已领取的天数。 */
+function minimaxClaimedDays(days) {
+  const todayNo = Number(days.find((day) => day?.is_today)?.day_no) || 0;
+  if (!todayNo) return 0;
+  return days.filter((day) => {
+    const no = Number(day?.day_no);
+    return Number.isFinite(no) && no <= todayNo && day?.status === MINIMAX_DAY.CLAIMED;
+  }).length;
+}
+
+/**
+ * 积分余额：credit/details 是积分发放流水，汇总剩余额度即可。
+ * 只是锦上添花，失败不影响签到结果。
+ */
+async function minimaxCredits(credential) {
+  try {
+    const payload = (await minimaxRequest(credential, MINIMAX_CREDIT_DETAILS, {
+      query: { page: '1', page_size: '50' },
+    })).payload;
+    const rows = (Array.isArray(payload?.details) ? payload.details : [])
+      .map((row) => ({ remaining: Number(row?.remaining_amount), expireAtMs: Number(row?.expire_at_ms) }))
+      .filter((row) => Number.isFinite(row.remaining) && row.remaining > 0);
+    if (rows.length === 0) return { balance: 0 };
+    const balance = Math.round(rows.reduce((sum, row) => sum + row.remaining, 0) * 100) / 100;
+    const expireAtMs = rows.reduce(
+      (earliest, row) => (Number.isFinite(row.expireAtMs) && row.expireAtMs > 0 && (!earliest || row.expireAtMs < earliest) ? row.expireAtMs : earliest),
+      0,
+    );
+    return { balance, ...(expireAtMs ? { expireAtMs } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
+function formatDayMs(ms) {
+  if (!Number.isFinite(ms)) return undefined;
+  const date = new Date(ms);
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+/** 面板第二行的小字：积分余额 / 过期日 / 明日奖励 / 本周期进度。 */
+function minimaxMeta({ credits, nextPoints, claimedDays } = {}) {
+  const parts = [];
+  if (Number.isFinite(credits?.balance)) parts.push(`积分余额 ${credits.balance}`);
+  const expires = formatDayMs(credits?.expireAtMs);
+  if (expires) parts.push(`${expires} 过期`);
+  if (Number.isFinite(nextPoints) && nextPoints > 0) parts.push(`明日 +${nextPoints}`);
+  if (claimedDays) parts.push(`本周期 ${claimedDays}/7 天`);
+  return parts.length > 0 ? parts.join(' · ') : undefined;
+}
+
+async function runMinimax() {
+  const at = new Date().toISOString();
+  const base = { uid: 'minimax', nickname: TITLE.minimax, at };
+  if (String(process.env.MINIMAX_DISABLED ?? '').trim() === '1') return undefined;
+  let credential;
+  try {
+    credential = minimaxCredential();
+  } catch (error) {
+    return { ...base, state: 'failed', error: shortText(error?.message || error) };
+  }
+  if (Number.isFinite(credential.expiresAtMs) && credential.expiresAtMs <= Date.now() + 60_000) {
+    return {
+      ...base,
+      state: 'failed',
+      error: 'MiniMax 登录态已过期：打开一次 MiniMax Code（会自动刷新），再点重试',
+    };
+  }
+  try {
+    const panel = minimaxData(await minimaxRequest(credential, MINIMAX_SIGNIN_STATUS), '签到状态查询');
+    const days = Array.isArray(panel?.days) ? panel.days : [];
+    const todayEntry = days.find((day) => day?.is_today);
+    const todayNo = Number(todayEntry?.day_no) || 0;
+    const claimable = days.find((day) => day?.status === MINIMAX_DAY.CLAIMABLE);
+    // 明天（第 7 天之后回到新一周期的第 1 天）的奖励，用于「明日 +X」。
+    const nextDay = days.find((day) => Number(day?.day_no) === (todayNo % 7) + 1);
+    const before = await minimaxCredits(credential);
+    if (!claimable) {
+      if (todayEntry?.status === MINIMAX_DAY.CLAIMED) {
+        const credit = minimaxDayPoints(todayEntry);
+        return {
+          ...base,
+          state: 'already',
+          credit,
+          balance: before?.balance,
+          detail: `今天已领取（+${credit} 积分，第 ${todayEntry.day_no}/7 天）`,
+          meta: minimaxMeta({
+            credits: before,
+            nextPoints: minimaxDayPoints(nextDay),
+            claimedDays: minimaxClaimedDays(days),
+          }),
+        };
+      }
+      return {
+        ...base,
+        state: 'already',
+        detail: '今天没有可领取的签到奖励',
+        meta: minimaxMeta({ credits: before, nextPoints: minimaxDayPoints(nextDay) }),
+      };
+    }
+    const claim = minimaxData(
+      await minimaxRequest(credential, MINIMAX_SIGNIN_CLAIM, { method: 'POST' }),
+      '签到领取',
+    );
+    const credit = Number.isFinite(claim?.points) ? claim.points : minimaxDayPoints(claimable);
+    const dayNo = claim?.day_no ?? claimable.day_no;
+    const alreadyClaimed = claim?.claim_result === 2;
+    // 领取后余额变了，重新取一次。
+    const after = alreadyClaimed ? before : await minimaxCredits(credential);
+    const meta = minimaxMeta({
+      credits: after,
+      nextPoints: minimaxDayPoints(nextDay),
+      claimedDays: minimaxClaimedDays(days) + (alreadyClaimed ? 0 : 1),
+    });
+    const detail = alreadyClaimed
+      ? `今天已领取（+${credit} 积分，第 ${dayNo}/7 天）`
+      : `领取成功 +${credit} 积分（第 ${dayNo}/7 天）`;
+    return {
+      ...base,
+      state: alreadyClaimed ? 'already' : 'signed',
+      credit,
+      balance: after?.balance,
+      detail,
+      ...(meta ? { meta } : {}),
+    };
+  } catch (error) {
+    return { ...base, state: 'failed', error: shortText(error?.message || error) };
+  }
+}
+
+// ---------------------------------------------------------------- 码道 CodeArts（网页端每日签到）
+
+function codeartsClaimScript() {
+  return fileURLToPath(new URL('./codearts-claim.mjs', import.meta.url));
+}
+
+function codeartsNodeExe() {
+  for (const candidate of runtimeNodeCandidates()) {
+    if (candidate !== 'node' && existsSync(candidate)) return candidate;
+  }
+  return process.execPath;
+}
+
+/** 子进程只带必要环境变量，避免把 NODE_* / DEBUG 之类调试开关带进去（Playwright 协议日志可能含 Cookie）。 */
+function codeartsChildEnv() {
+  const names = [
+    'PATH',
+    'Path',
+    'PATHEXT',
+    'SystemRoot',
+    'SystemDrive',
+    'windir',
+    'COMSPEC',
+    'TEMP',
+    'TMP',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'USERPROFILE',
+    'HOMEDRIVE',
+    'HOMEPATH',
+    'DSH_HOME',
+    'PLAYWRIGHT_CORE_PATH',
+    'PLAYWRIGHT_BROWSERS_PATH',
+  ];
+  const env = {};
+  for (const name of names) if (process.env[name] !== undefined) env[name] = process.env[name];
+  env.CODEARTS_PROFILE_DIR = CODEARTS_PROFILE_DIR;
+  env.CODEARTS_STATE_PATH = CODEARTS_STATE_PATH;
+  env.CODEARTS_BASE_URL = CODEARTS_BASE;
+  return env;
+}
+
+function clampTimeout(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+/** 杀子进程树（node 子进程还会拉起 Chromium 孙进程，只 kill 父进程会留孤儿）。 */
+function killProcessTree(child) {
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.on('error', () => {});
+      return;
+    }
+    child.kill();
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 跑无头浏览器领取脚本（codearts-claim.mjs），解析它输出的一行 JSON。 */
+function runCodeartsBrowser(timeoutMs = 180000) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(codeartsNodeExe(), [codeartsClaimScript()], {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: codeartsChildEnv(),
+      });
+    } catch (error) {
+      resolve({ ok: false, reason: 'error', error: String(error?.message || error) });
+      return;
+    }
+    let stdout = '';
+    let stderr = '';
+    let parsed;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const takeParsed = () => {
+      for (const line of stdout.split(/\r?\n/)) {
+        const text = line.trim();
+        if (!text.startsWith('{') || !text.endsWith('}')) continue;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          /* 继续找 */
+        }
+      }
+      return parsed;
+    };
+    const timer = setTimeout(() => {
+      killProcessTree(child);
+      const last = takeParsed();
+      // 超时但脚本其实已经输出结果（例如卡在关浏览器）时，用已解析到的成功结果
+      if (last && last.ok === true) finish(last);
+      else finish({ ok: false, reason: 'error', error: '码道领取脚本超时' });
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+      takeParsed();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', (error) => finish({ ok: false, reason: 'error', error: String(error?.message || error) }));
+    child.on('close', (code) => {
+      const last = takeParsed();
+      if (last) {
+        finish(last);
+        return;
+      }
+      finish({
+        ok: false,
+        reason: 'error',
+        error: `码道领取脚本退出码 ${code}${stderr ? `：${shortText(stderr.trim(), 160)}` : ''}`,
+      });
+    });
+  });
+}
+
+/** 码道「活动福利 → 每日签到」：无头浏览器打开页面 → 页面内调活动接口领取。 */
+async function runCodearts() {
+  const at = new Date().toISOString();
+  const base = { uid: 'codearts', nickname: TITLE.codearts, at };
+  if (String(process.env.CODEARTS_DISABLED ?? '').trim() === '1') return undefined;
+  if (!existsSync(CODEARTS_STATE_PATH)) {
+    return {
+      ...base,
+      state: 'failed',
+      error: '还没有码道登录态：请运行插件目录里的「码道登录.cmd」登录一次',
+    };
+  }
+  const timeoutMs = clampTimeout(process.env.CODEARTS_CLAIM_TIMEOUT_MS, 180000, 60000, 600000);
+  const result = await runCodeartsBrowser(timeoutMs);
+  if (result?.nickname) base.nickname = result.nickname;
+  if (result?.ok) {
+    return {
+      ...base,
+      state: result.state === 'signed' ? 'signed' : 'already',
+      credit: typeof result.credit === 'number' && Number.isFinite(result.credit) ? result.credit : undefined,
+      detail: result.detail,
+    };
+  }
+  if (result?.reason === 'login-required') {
+    return {
+      ...base,
+      state: 'failed',
+      error: '码道登录态已过期：请运行插件目录里的「码道登录.cmd」重新登录',
+    };
+  }
+  if (result?.reason === 'network-error') {
+    return {
+      ...base,
+      state: 'failed',
+      error: `码道页面/接口不可达：${shortText(result?.error || '网络异常', 180)}`,
+    };
+  }
+  return {
+    ...base,
+    state: 'failed',
+    error: shortText(result?.error || '码道领取失败', 240),
   };
 }
 
@@ -1200,13 +1625,19 @@ function statusOf(saved) {
 
 async function run({ notice = true } = {}) {
   const results = [];
-  for (const task of [runWorkBuddy, runLingxi, runQoder]) {
+  const tasks = [
+    [runWorkBuddy, 'workbuddy'],
+    [runLingxi, 'lingxi'],
+    [runQoder, 'qoder'],
+    [runMinimax, 'minimax'],
+    [runCodearts, 'codearts'],
+  ];
+  for (const [task, uid] of tasks) {
     try {
       const produced = await task();
       if (Array.isArray(produced)) results.push(...produced);
       else if (produced) results.push(produced);
     } catch (error) {
-      const uid = task === runWorkBuddy ? 'workbuddy' : task === runLingxi ? 'lingxi' : 'qoder';
       results.push({
         uid,
         nickname: TITLE[uid] ?? uid,
@@ -1234,10 +1665,21 @@ async function run({ notice = true } = {}) {
   return save(saved);
 }
 
+/** 同一时间只允许一次签到运行（DSH 启动、面板打开、手动重试可能并发触发）。 */
+let inFlightRun;
+function runOnce(options) {
+  if (!inFlightRun) {
+    inFlightRun = run(options).finally(() => {
+      inFlightRun = undefined;
+    });
+  }
+  return inFlightRun;
+}
+
 /** 跨天后第一次打开面板自动补签当天。 */
 async function ensureToday() {
   const saved = await load();
-  return saved?.day === today() ? saved : run({ notice: false });
+  return saved?.day === today() ? saved : runOnce({ notice: false });
 }
 
 /** 把 notice 交给第一个读者后清除（避免每次重开面板都弹提示）。 */
@@ -1255,6 +1697,32 @@ async function claimNotice() {
     /* ignore */
   }
   return latest;
+}
+
+/**
+ * 跨天自动补签：DSH 长期开着时，每小时看一眼日期是否变了，变了就跑一轮。
+ * 只用文件里的日期判断，不额外调用接口；同一天最多触发一次（失败可手动重试）。
+ */
+const DAILY_TIMER_MS = 60 * 60 * 1000;
+let timerDay;
+function startDailyTimer({ intervalMs = DAILY_TIMER_MS, runner = runOnce } = {}) {
+  const timer = setInterval(() => {
+    const day = today();
+    if (timerDay === day) return;
+    load()
+      .then((saved) => {
+        if (saved?.day === day || timerDay === day) {
+          timerDay = day;
+          return;
+        }
+        timerDay = day;
+        void runner({ notice: false }).catch(() => {});
+      })
+      .catch(() => {});
+  }, intervalMs);
+  // 不要因为这个定时器让 DSH 无法退出。
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 // ---------------------------------------------------------------- Web 接口 / 挂载
@@ -1294,10 +1762,17 @@ function respond(res, saved) {
 }
 
 export function apply(ctx) {
-  const startup = run().catch((error) => {
+  const startup = runOnce().catch((error) => {
     ctx.logger.warn?.(error);
   });
-  ctx.logger.info?.('[daily-checkin] 启动签到已排队（WPS 灵犀 / Qoder）');
+  ctx.logger.info?.('[daily-checkin] 启动签到已排队（WorkBuddy / 灵犀 / Qoder / MiniMax / 码道）');
+
+  // DSH 长期开着时也能每天自动签：日期一变就跑一轮（不需要重启 DSH）。
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => startDailyTimer(), 'dsh-daily-checkin: daily timer');
+  } else {
+    startDailyTimer();
+  }
 
   ctx.inject(['webServer'], (webCtx) =>
     webCtx.effect(() => {
@@ -1311,14 +1786,22 @@ export function apply(ctx) {
             return;
           }
           if (req.method === 'GET') {
-            await startup;
+            // 启动签到可能包含码道无头浏览器（最长约 1 分钟），面板请求等不起这么久：
+            // 只等 12 秒，没跑完就先返回上一次结果；跨天补签放到后台继续。
+            const finished = await Promise.race([startup.then(() => true), sleep(12000).then(() => false)]);
+            if (!finished) {
+              const saved = await load();
+              if (!saved || saved.day !== today()) void runOnce({ notice: false }).catch(() => {});
+              respond(res, saved);
+              return;
+            }
             await ensureToday();
             respond(res, await claimNotice());
             return;
           }
           if (req.method === 'POST') {
             await startup;
-            respond(res, await run({ notice: false }));
+            respond(res, await runOnce({ notice: false }));
             return;
           }
           res.writeHead(405, { allow: 'GET, POST' });
@@ -1331,3 +1814,9 @@ export function apply(ctx) {
     }, 'dsh-daily-checkin: status'),
   );
 }
+
+/** 仅供本地自测/排障使用（DSH 加载插件时忽略多余导出）。 */
+export const internals =
+  process.env.DSH_DAILY_CHECKIN_DEBUG === '1'
+    ? { run, runCodearts, runCodeartsBrowser, runMinimax, startDailyTimer }
+    : undefined;

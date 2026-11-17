@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Daily Check-in",
-    "description": "Runs the WorkBuddy, WPS Lingxi and Qoder daily check-ins when DSH starts, with a status panel in the session title bar."
+    "title": "Daily Check-in (WorkBuddy / Lingxi / Qoder / MiniMax / CodeArts)",
+    "description": "Automatically completes daily check-ins for WorkBuddy, WPS Lingxi, Qoder, MiniMax Code and CodeArts on DSH startup, with a status panel in the session header."
   }
 }

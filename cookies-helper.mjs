@@ -10,11 +10,11 @@
  */
 
 import { readFileSync, writeFileSync, rmSync } from 'node:fs';
-import { createDecipheriv } from 'node:crypto';
+import { createDecipheriv, createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 
-function decryptChromiumValue(key, encryptedValue) {
+function decryptChromiumValue(key, encryptedValue, hostKey) {
   const value = Buffer.isBuffer(encryptedValue) ? encryptedValue : Buffer.from(encryptedValue ?? []);
   if (value.length === 0) return '';
   const prefix = value.subarray(0, 3).toString('latin1');
@@ -35,7 +35,16 @@ function decryptChromiumValue(key, encryptedValue) {
   }
   if (plain.length > 32) {
     const head = plain.subarray(0, 32);
-    if ([...head].some((byte) => byte < 0x20 || byte > 0x7e)) plain = plain.subarray(32);
+    let bound = false;
+    if (typeof hostKey === 'string' && hostKey) {
+      try {
+        bound = createHash('sha256').update(hostKey).digest().equals(head);
+      } catch {
+        bound = false;
+      }
+    }
+    if (!bound && [...head].some((byte) => byte < 0x20 || byte > 0x7e)) bound = true;
+    if (bound) plain = plain.subarray(32);
   }
   return plain.toString('utf8');
 }
@@ -107,7 +116,7 @@ async function main() {
           let value = plainValue;
           if (!value && row.encrypted_value) {
             try {
-              value = decryptChromiumValue(key, row.encrypted_value);
+              value = decryptChromiumValue(key, row.encrypted_value, host);
             } catch {
               continue;
             }
