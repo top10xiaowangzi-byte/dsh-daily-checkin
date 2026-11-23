@@ -11,3 +11,8 @@ node_modules/
 # 本地私有配置
 .env
 .env.local
+
+# 运行态凭据 / 状态（$DSH_HOME 指到仓库目录时也绝不提交）
+.daily-checkin.json
+codearts-session.json
+codearts-profile/
